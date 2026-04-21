@@ -1,0 +1,46 @@
+# Data & outputs
+data/
+eval_out/
+
+# Checkpoints / weights
+*.pt
+*.bin
+*.safetensors
+
+# Experiment dirs (ckpts + logs)
+**/exp_*/
+**/log/
+**/tensorboard/
+
+# External / cache
+icefall/
+models/
+.hf-cache/
+.hf-cache-local/
+hf_zipformer30m_streaming_benchmark/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Secrets (NEVER)
+client.json
+youtube_auth_cookies.txt
+*.credentials
+*_secret*
+.env
+
+# Local Claude/codex
+.claude/
+.codex
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Temp
+/tmp/backupdatavoice_shards/
+backup_drive.log

@@ -1,0 +1,2898 @@
+#!/usr/bin/env python3
+# Copyright    2021-2024  Xiaomi Corp.              (authors: Fangjun Kuang,
+#                                                             Wei Kang,
+#                                                             Mingshuang Luo,
+#                                                             Zengwei Yao,
+#                                                             Yifan Yang,
+#                                                             Daniel Povey)
+# Copyright    2024  Shanghai Jiao Tong University  (authors: Jianheng Zhuo)
+#
+# See ../../../../LICENSE for clarification regarding multiple authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Usage:
+
+export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+
+# For HuBERT model finetuning:
+./hubert/finetune.py \
+  --world-size 8 \
+  --num-epochs 200 \
+  --start-epoch 1 \
+  --use-fp16 1 \
+  --exp-dir hubert/exp \
+  --full-libri 0 \
+  --max-duration 1000
+
+It supports finetuning with:
+  - transducer loss (default), with `--use-transducer True --use-ctc False`
+  - ctc loss (not recommended), with `--use-transducer False --use-ctc True`
+  - transducer loss & ctc loss, with `--use-transducer True --use-ctc True`
+"""
+
+
+import argparse
+import copy
+import logging
+import platform
+import warnings
+from pathlib import Path, PurePosixPath
+from shutil import copyfile
+
+# Fix: checkpoints saved on Linux contain PosixPath objects that can't
+# be unpickled on Windows.  Map them to WindowsPath transparently.
+if platform.system() == "Windows":
+    import pathlib
+    pathlib.PosixPath = pathlib.WindowsPath
+from typing import Any, Dict, Optional, Tuple, Union
+
+import k2
+import optim
+from tokenizer import TokenEncoder
+import torch
+import torch.multiprocessing as mp
+import torch.nn as nn
+from asr_datamodule import LibriSpeechAsrDataModule
+from decoder import Decoder
+from hubert_ce import HubertModel
+from joiner import Joiner
+from lhotse.cut import Cut
+from lhotse.dataset.sampling.base import CutSampler
+from lhotse.utils import fix_random_seed
+from model import AsrModel
+from multi_speaker_model import MultiSpeakerRnntModel
+from optim import Eden, ScaledAdam
+from torch import Tensor
+from torch.cuda.amp import GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
+
+from icefall import diagnostics
+from icefall.checkpoint import load_checkpoint, remove_checkpoints
+from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
+from icefall.checkpoint import (
+    save_checkpoint_with_global_batch_idx,
+    update_averaged_model,
+)
+from icefall.dist import cleanup_dist, setup_dist
+from icefall.env import get_env_info
+from icefall.hooks import register_inf_check_hooks
+from icefall.utils import (
+    torch_autocast,
+    AttributeDict,
+    MetricsTracker,
+    get_parameter_groups_with_lrs,
+    setup_logger,
+    str2bool,
+)
+
+LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
+
+
+def get_adjusted_batch_count(params: AttributeDict) -> float:
+    # returns the number of batches we would have used so far if we had used the reference
+    # duration.  This is for purposes of set_batch_count().
+    return (
+        params.batch_idx_train
+        * params.accum_grad
+        * (params.max_duration * params.world_size)
+        / params.ref_duration
+    )
+
+
+def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
+    if isinstance(model, DDP):
+        # get underlying nn.Module
+        model = model.module
+    for name, module in model.named_modules():
+        if hasattr(module, "batch_count"):
+            module.batch_count = batch_count
+        if hasattr(module, "name"):
+            module.name = name
+
+
+def add_model_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--num-encoder-layers",
+        type=str,
+        default="2,2,3,4,3,2",
+        help="Number of zipformer encoder layers per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--downsampling-factor",
+        type=str,
+        default="1,2,4,8,4,2",
+        help="Downsampling factor for each stack of encoder layers.",
+    )
+
+    parser.add_argument(
+        "--feedforward-dim",
+        type=str,
+        default="512,768,1024,1536,1024,768",
+        help="Feedforward dimension of the zipformer encoder layers, per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--num-heads",
+        type=str,
+        default="4,4,4,8,4,4",
+        help="Number of attention heads in the zipformer encoder layers: a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--encoder-dim",
+        type=str,
+        default="192,256,384,512,384,256",
+        help="Embedding dimension in encoder stacks: a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--query-head-dim",
+        type=str,
+        default="32",
+        help="Query/key dimension per head in encoder stacks: a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--value-head-dim",
+        type=str,
+        default="12",
+        help="Value dimension per head in encoder stacks: a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--pos-head-dim",
+        type=str,
+        default="4",
+        help="Positional-encoding dimension per head in encoder stacks: a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--pos-dim",
+        type=int,
+        default="48",
+        help="Positional-encoding embedding dimension",
+    )
+
+    parser.add_argument(
+        "--encoder-unmasked-dim",
+        type=str,
+        default="192,192,256,256,256,192",
+        help="Unmasked dimensions in the encoders, relates to augmentation during training.  "
+        "A single int or comma-separated list.  Must be <= each corresponding encoder_dim.",
+    )
+
+    parser.add_argument(
+        "--cnn-module-kernel",
+        type=str,
+        default="31,31,15,15,15,31",
+        help="Sizes of convolutional kernels in convolution modules in each encoder stack: "
+        "a single int or comma-separated list.",
+    )
+
+    # hubert parameters
+    parser.add_argument(
+        "--label-rate",
+        type=float,
+        default=50,
+    )
+
+    parser.add_argument(
+        "--sample-rate",
+        type=float,
+        default=16000,
+    )
+
+    parser.add_argument(
+        "--extractor-mode",
+        type=str,
+        default="default",
+        help="""mode for feature extractor, should in EXTRACTOR_MODE_CHOICES. default has a single group 
+            norm with d groups in the first conv block, whereas layer_norm 
+            has layer norms in every block (meant to use with normalize=True)""",
+    )
+
+    parser.add_argument(
+        "--conv-feature-layers",
+        type=str,
+        default="[(512,10,5)] + [(512,3,2)] * 4 + [(512,2,2)] * 2",
+        help="string describing convolutional feature extraction layers in form of a python list that contains [(dim, kernel_size, stride), ...]",
+    )
+
+    parser.add_argument(
+        "--conv-bias", type=str2bool, default=False, help="include bias in conv encoder"
+    )
+
+    parser.add_argument(
+        "--feature-grad-mult",
+        type=float,
+        default=1.0,
+        help="multiply feature extractor var grads by this",
+    )
+
+    # masking
+    parser.add_argument("--mask-length", type=int, default=10, help="mask_length")
+
+    parser.add_argument(
+        "--mask-prob",
+        type=float,
+        default=0.65,
+        help="probability of replacing a token with mask",
+    )
+
+    parser.add_argument(
+        "--mask-selection",
+        type=str,
+        choices=["static", "uniform", "normal", "poisson"],
+        default="static",
+        help="how to choose mask length",
+    )
+
+    parser.add_argument(
+        "--mask-other",
+        type=float,
+        default=0,
+        help="secondary mask argument (used for more complex distributions),see help in compute_mask_indicesh",
+    )
+
+    parser.add_argument(
+        "--no-mask-overlap",
+        type=str2bool,
+        default=False,
+        help="whether to allow masks to overlap",
+    )
+
+    parser.add_argument(
+        "--mask-min-space",
+        type=int,
+        default=1,
+        help="min space between spans (if no overlap is enabled)",
+    )
+
+    # channel masking
+    parser.add_argument(
+        "--mask-channel-length",
+        type=int,
+        default=10,
+        help="length of the mask for features (channels)",
+    )
+
+    parser.add_argument(
+        "--mask-channel-prob",
+        type=float,
+        default=0.0,
+        help="probability of replacing a feature with 0",
+    )
+
+    parser.add_argument(
+        "--mask-channel-selection",
+        type=str,
+        choices=["static", "uniform", "normal", "poisson"],
+        default="static",
+        help="how to choose mask length for channel masking",
+    )
+
+    parser.add_argument(
+        "--mask-channel-other",
+        type=float,
+        default=0,
+        help="secondary mask argument (used for more complex distributions), see help in compute_mask_indicesh",
+    )
+
+    parser.add_argument(
+        "--no-mask-channel-overlap",
+        type=str2bool,
+        default=False,
+        help="whether to allow channel masks to overlap",
+    )
+
+    parser.add_argument(
+        "--mask-channel-min-space",
+        type=int,
+        default=1,
+        help="min space between spans (if no overlap is enabled)",
+    )
+
+    # loss computation
+    parser.add_argument(
+        "--skip-masked",
+        type=str2bool,
+        default=False,
+        help="skip computing losses over masked frames",
+    )
+
+    parser.add_argument(
+        "--skip-nomask",
+        type=str2bool,
+        default=False,
+        help="skip computing losses over unmasked frames",
+    )
+
+    parser.add_argument(
+        "--checkpoint-activations",
+        type=str2bool,
+        default=False,
+        help="recompute activations and save memory for extra compute",
+    )
+
+    parser.add_argument(
+        "--pred-masked-weight",
+        type=float,
+        default=1,
+        help="weight for masked part in ssl loss",
+    )
+
+    parser.add_argument(
+        "--pred-nomask-weight",
+        type=float,
+        default=0,
+        help="weight for masked part in ssl loss",
+    )
+
+    parser.add_argument(
+        "--loss-weights",
+        type=float,
+        nargs="*",
+        default=[10],
+        help="weight for masked part in ssl loss",
+    )
+
+    # FP16 optimization
+    parser.add_argument(
+        "--required-seq-len-multiple",
+        type=int,
+        default=2,
+        help="pad the input to encoder such that the sequence length is divisible by multiple",
+    )
+
+    parser.add_argument(
+        "--attn-type", type=str, default="", help="if espnet use ESPNET MHA"
+    )
+
+    parser.add_argument(
+        "--pos-enc-type",
+        type=str,
+        default="abs",
+        help="Positional encoding type to use in conformer",
+    )
+
+    parser.add_argument(
+        "--logit-temp", type=float, default=0.1, help="temperature to divide logits by"
+    )
+
+    parser.add_argument(
+        "--dropout-input",
+        type=float,
+        default=0.0,
+        help="dropout to apply to the input (after feat extr)",
+    )
+
+    parser.add_argument(
+        "--dropout-features",
+        type=float,
+        default=0.0,
+        help="dropout to apply to the features (after feat extr)",
+    )
+
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        nargs="*",
+        default=[504],
+        help="""num class, a little larger than the number of cluster,
+        the largest is for padding, 
+        and the value should be the multiple of 4, for faster computation""",
+    )
+
+    parser.add_argument(
+        "--untie-final-proj",
+        type=str2bool,
+        default=False,
+        help="use separate projection for each target",
+    )
+
+    parser.add_argument(
+        "--decoder-dim",
+        type=int,
+        default=512,
+        help="Embedding dimension in the decoder model.",
+    )
+
+    parser.add_argument(
+        "--joiner-dim",
+        type=int,
+        default=512,
+        help="""Dimension used in the joiner model.
+        Outputs from the encoder and decoder model are projected
+        to this dimension before adding.
+        """,
+    )
+
+    parser.add_argument(
+        "--use-transducer",
+        type=str2bool,
+        default=True,
+        help="If True, use Transducer head.",
+    )
+
+    parser.add_argument(
+        "--use-ctc",
+        type=str2bool,
+        default=True,
+        help="If True, use CTC head for hybrid CTC+RNNT training.",
+    )
+
+    parser.add_argument(
+        "--ctc-loss-scale",
+        type=float,
+        default=0.3,
+        help="Scale for CTC loss in hybrid CTC+RNNT: total = α·CTC + RNNT.",
+    )
+
+    parser.add_argument(
+        "--ctc-only-steps",
+        type=int,
+        default=0,
+        help="Number of initial steps to train CTC-only (no transducer loss). "
+        "Helps encoder learn alignment before RNNT kicks in. Typical: 2000.",
+    )
+
+    parser.add_argument(
+        "--delay-penalty",
+        type=float,
+        default=0.0,
+        help="Penalty for symbol delay in RNNT loss. Encourages earlier emission "
+        "for streaming. Only active after warmup. Typical value: 0.0-0.2.",
+    )
+
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=3,
+        help="Maximum number of speakers for multi-talker ASR.",
+    )
+
+    parser.add_argument(
+        "--chunk-size-frames",
+        type=int,
+        default=50,
+        help="Chunk size (in frames) for streaming multi-speaker training.",
+    )
+
+    parser.add_argument(
+        "--chunk-samples",
+        type=int,
+        default=None,
+        help="Chunk size (in waveform samples). Overrides --chunk-size-frames.",
+    )
+
+    parser.add_argument(
+        "--use-pyannote-diar",
+        type=str2bool,
+        default=False,
+        help="Use pretrained pyannote segmentation model as diar head.",
+    )
+
+    parser.add_argument(
+        "--pyannote-weight-dir",
+        type=str,
+        default="weight",
+        help="Path to pyannote segmentation model weights.",
+    )
+
+    parser.add_argument(
+        "--freeze-pyannote",
+        type=str2bool,
+        default=True,
+        help="Freeze pyannote segmentation parameters (recommended).",
+    )
+
+    parser.add_argument(
+        "--freeze-encoder",
+        type=str2bool,
+        default=False,
+        help="Freeze HuBERT encoder (conv frontend + zipformer). "
+             "Use this to let decoder/joiner/CTC head learn first "
+             "before fine-tuning encoder.",
+    )
+    parser.add_argument(
+        "--kd-teacher-path",
+        type=str,
+        default="",
+        help="Path to Teacher JIT .pt file for KD distillation. "
+             "Empty string disables KD.",
+    )
+    parser.add_argument(
+        "--kd-teacher-tokens",
+        type=str,
+        default="",
+        help="Optional teacher token table path (<piece> <id>). "
+             "If empty, auto-detect near KD teacher JIT (tokens.txt or config.json).",
+    )
+    parser.add_argument(
+        "--kd-objective",
+        type=str,
+        default="ctc",
+        choices=["ctc", "rnnt", "both"],
+        help="KD objective type: ctc (CTC logit KD), rnnt (RNNT simple AM/LM KD), or both.",
+    )
+    parser.add_argument(
+        "--kd-loss-scale",
+        type=float,
+        default=0.5,
+        help="Weight of the KD loss term: total_loss += kd_loss_scale * kd_loss.",
+    )
+    parser.add_argument(
+        "--kd-temperature",
+        type=float,
+        default=4.0,
+        help="Softmax temperature for KD softening. Higher = softer targets.",
+    )
+    parser.add_argument(
+        "--decoder-ce-scale",
+        type=float,
+        default=0.0,
+        help="Auxiliary CE loss scale on decoder-end simple LM logits. "
+             "0 logs only (if RNNT aux tensors are available) and disables optimization.",
+    )
+    parser.add_argument(
+        "--joiner-ce-scale",
+        type=float,
+        default=0.0,
+        help="Auxiliary CE loss scale on joiner-end diagonal logits. "
+             "0 logs only when RNNT aux tensors are available.",
+    )
+    parser.add_argument(
+        "--joiner-kd-scale",
+        type=float,
+        default=0.0,
+        help="Scale for teacher-student KD on joiner-end diagonal logits. "
+             "0 disables optimization but still logs when RNNT KD is active.",
+    )
+    parser.add_argument(
+        "--kd-log-raw-nonblank",
+        type=str2bool,
+        default=True,
+        help="Log raw KD diagnostics and non-blank KD diagnostics (blank class excluded). "
+             "This does not change optimization unless KD scales are non-zero.",
+    )
+    parser.add_argument(
+        "--kd-log-on-valid",
+        type=str2bool,
+        default=True,
+        help="Compute and log KD diagnostics during validation steps. "
+             "Validation objective (best-valid-loss) remains unchanged.",
+    )
+    parser.add_argument(
+        "--kd-fitnet-scale",
+        type=float,
+        default=0.0,
+        help="Weight for FitNet feature distillation loss (stack 3). "
+             "0 disables FitNet KD.",
+    )
+    parser.add_argument(
+        "--kd-mgd-scale",
+        type=float,
+        default=0.0,
+        help="Weight for MGD feature distillation loss (stack 5). "
+             "0 disables MGD KD.",
+    )
+    parser.add_argument(
+        "--kd-mgd-mask-ratio",
+        type=float,
+        default=0.75,
+        help="Fraction of frames selected for MGD loss computation.",
+    )
+    parser.add_argument(
+        "--kd-phase-a-steps",
+        type=int,
+        default=5000,
+        help="Step at which Phase A ends and Phase B begins. "
+             "Phase A: FitNet only. Phase B: FitNet+MGD+ramping DKD.",
+    )
+    parser.add_argument(
+        "--kd-phase-b-steps",
+        type=int,
+        default=15000,
+        help="Step at which Phase B ends and Phase C begins. "
+             "Phase C: all three losses at full scale.",
+    )
+    parser.add_argument(
+        "--encoder-lr-scale",
+        type=float,
+        default=0.1,
+        help="LR scale for encoder relative to base_lr during unfreeze. "
+             "encoder_lr = base_lr * encoder_lr_scale. Default 0.1.",
+    )
+    parser.add_argument(
+        "--pyannote-phase",
+        type=int,
+        default=1,
+        help=(
+            "Phase 1: ASR with oracle activity. "
+            "Phase 2: ASR with pyannote-predicted activity."
+        ),
+    )
+
+    parser.add_argument(
+        "--enable-pre-asr-stream-routing",
+        type=str2bool,
+        default=True,
+        help="Route target/active speaker streams before ASR encoder (paper-style). "
+        "Default=True for this project. Requires teacher activity "
+        "(spk_activity or teacher_activity).",
+    )
+
+    parser.add_argument(
+        "--pre-asr-active-threshold",
+        type=float,
+        default=0.5,
+        help="Activity threshold to mark a speaker slot active in "
+        "pre-ASR stream routing mode.",
+    )
+
+    parser.add_argument(
+        "--spk-kernel-dropout",
+        type=float,
+        default=0.5,
+        help="Dropout rate in SpeakerKernel feedforward (NeMo default 0.5).",
+    )
+
+    parser.add_argument(
+        "--bg-threshold",
+        type=float,
+        default=0.5,
+        help="Activity threshold for building bg_mask in SpeakerKernel "
+        "(NeMo default 0.5). Inactive speakers with activity > this "
+        "threshold are flagged as background.",
+    )
+
+    parser.add_argument(
+        "--activity-teacher-forcing",
+        type=float,
+        default=1.0,
+        help="Initial teacher forcing probability for speaker activity.",
+    )
+
+    parser.add_argument(
+        "--activity-teacher-forcing-final",
+        type=float,
+        default=0.0,
+        help="Final teacher forcing probability for speaker activity.",
+    )
+
+    parser.add_argument(
+        "--activity-teacher-forcing-warmup-steps",
+        type=int,
+        default=50000,
+        help="Linear schedule length for activity teacher forcing.",
+    )
+
+    parser.add_argument(
+        "--causal",
+        type=str2bool,
+        default=True,
+        help="Build the encoder in causal mode for streaming training.",
+    )
+
+    parser.add_argument(
+        "--chunk-size",
+        type=str,
+        default="32",
+        help="Zipformer causal chunk size in encoder frames (comma-separated for random sampling).",
+    )
+
+    parser.add_argument(
+        "--left-context-frames",
+        type=str,
+        default="64",
+        help="Zipformer causal left-context size in encoder frames.",
+    )
+
+    parser.add_argument(
+        "--decode-chunk-len",
+        type=int,
+        default=32,
+        help="Chunk size for streaming decoding (in encoder frames).",
+    )
+
+    parser.add_argument(
+        "--short-chunk-size",
+        type=int,
+        default=50,
+        help="Max dynamic chunk size during training. "
+             "Actual chunk is sampled from (1, short_chunk_size) per batch.",
+    )
+
+def get_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=1,
+        help="Number of GPUs for DDP training.",
+    )
+
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=12354,
+        help="Master port to use for DDP training.",
+    )
+
+    parser.add_argument(
+        "--tensorboard",
+        type=str2bool,
+        default=True,
+        help="Should various information be logged in tensorboard.",
+    )
+
+    parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=222,
+        help="Number of epochs to train.",
+    )
+
+    parser.add_argument(
+        "--start-epoch",
+        type=int,
+        default=1,
+        help="""Resume training from this epoch. It should be positive.
+        If larger than 1, it will load checkpoint from
+        exp-dir/epoch-{start_epoch-1}.pt
+        """,
+    )
+
+    parser.add_argument(
+        "--start-batch",
+        type=int,
+        default=0,
+        help="""If positive, --start-epoch is ignored and
+        it loads the checkpoint from exp-dir/checkpoint-{start_batch}.pt
+        """,
+    )
+
+    parser.add_argument(
+        "--exp-dir",
+        type=str,
+        default="hubert/exp",
+        help="""The experiment dir.
+        It specifies the directory where all training related
+        files, e.g., checkpoints, log, etc, are saved
+        """,
+    )
+
+    parser.add_argument(
+        "--pretrained-dir",
+        type=str,
+        help="""The pretrained model dir.
+        It specifies the directory where the pretrained checkpoint is saved.""",
+    )
+
+    parser.add_argument(
+        "--bpe-model",
+        type=str,
+        default="zipformer/tokens.txt",
+        help="Path to the BPE model",
+    )
+
+    parser.add_argument(
+        "--base-lr", type=float, default=0.001, help="The base learning rate."
+    )
+
+    parser.add_argument(
+        "--lr-batches",
+        type=float,
+        default=100000,
+        help="""Number of steps that affects how rapidly the learning rate
+        decreases. We suggest not to change this.""",
+    )
+
+    parser.add_argument(
+        "--lr-epochs",
+        type=float,
+        default=100,
+        help="""Number of epochs that affects how rapidly the learning rate decreases.
+        """,
+    )
+
+    parser.add_argument(
+        "--warmup-batches",
+        type=float,
+        default=0,
+        help="Number of batches over which Eden linearly warms up LR from 0.5× to 1× base_lr. "
+             "0 disables warmup (default). Useful when fine-tuning from a pretrained checkpoint.",
+    )
+
+    parser.add_argument(
+        "--ref-duration",
+        type=float,
+        default=600,
+        help="Reference batch duration for purposes of adjusting batch counts for setting various "
+        "schedules inside the model",
+    )
+
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=2,
+        help="The context size in the decoder. 1 means bigram; " "2 means tri-gram",
+    )
+
+    parser.add_argument(
+        "--prune-range",
+        type=int,
+        default=5,
+        help="The prune range for rnnt loss, it means how many symbols(context)"
+        "we are using to compute the loss",
+    )
+
+    parser.add_argument(
+        "--lm-scale",
+        type=float,
+        default=0.25,
+        help="The scale to smooth the loss with lm "
+        "(output of prediction network) part.",
+    )
+
+    parser.add_argument(
+        "--am-scale",
+        type=float,
+        default=0.0,
+        help="The scale to smooth the loss with am (output of encoder network)" "part.",
+    )
+
+    parser.add_argument(
+        "--simple-loss-scale",
+        type=float,
+        default=0.5,
+        help="To get pruning ranges, we will calculate a simple version"
+        "loss(joiner is just addition), this simple loss also uses for"
+        "training (as a regularization item). We will scale the simple loss"
+        "with this parameter before adding to the final loss.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="The seed for random generators intended for reproducibility",
+    )
+
+    parser.add_argument(
+        "--print-diagnostics",
+        type=str2bool,
+        default=False,
+        help="Accumulate stats on activations, print them and exit.",
+    )
+
+    parser.add_argument(
+        "--sanity-check",
+        type=str2bool,
+        default=False,
+        help="Check if any of the batches in epoch 1 would cause OOM.",
+    )
+
+    parser.add_argument(
+        "--inf-check",
+        type=str2bool,
+        default=False,
+        help="Add hooks to check for infinite module outputs and gradients.",
+    )
+
+    parser.add_argument(
+        "--save-every-n",
+        type=int,
+        default=100000,
+        help="""Save checkpoint after processing this number of batches"
+        periodically. We save checkpoint to exp-dir/ whenever
+        params.batch_idx_train % save_every_n == 0. The checkpoint filename
+        has the form: f'exp-dir/checkpoint-{params.batch_idx_train}.pt'
+        Note: It also saves checkpoint to `exp-dir/epoch-xxx.pt` at the
+        end of each epoch where `xxx` is the epoch number counting from 1.
+        """,
+    )
+
+    parser.add_argument(
+        "--keep-last-k",
+        type=int,
+        default=30,
+        help="""Only keep this number of checkpoints on disk.
+        For instance, if it is 3, there are only 3 checkpoints
+        in the exp-dir with filenames `checkpoint-xxx.pt`.
+        It does not affect checkpoints with name `epoch-xxx.pt`.
+        """,
+    )
+
+    parser.add_argument(
+        "--average-period",
+        type=int,
+        default=200,
+        help="""Update the averaged model, namely `model_avg`, after processing
+        this number of batches. `model_avg` is a separate version of model,
+        in which each floating-point parameter is the average of all the
+        parameters from the start of training. Each time we take the average,
+        we do: `model_avg = model * (average_period / batch_idx_train) +
+            model_avg * ((batch_idx_train - average_period) / batch_idx_train)`.
+        """,
+    )
+
+    parser.add_argument(
+        "--accum-grad",
+        type=int,
+        default=1,
+        help="""update gradient when batch_idx_train % accum_grad == 0.
+        """,
+    )
+
+    parser.add_argument(
+        "--use-fp16",
+        type=str2bool,
+        default=False,
+        help="Whether to use half precision training.",
+    )
+
+    parser.add_argument(
+        "--use-bf16",
+        type=str2bool,
+        default=False,
+        help="Use bfloat16 mixed precision (no grad scaler needed, wider dynamic range).",
+    )
+
+    add_model_arguments(parser)
+
+    return parser
+
+
+def get_params() -> AttributeDict:
+    """Return a dict containing training parameters.
+
+    All training related parameters that are not passed from the commandline
+    are saved in the variable `params`.
+
+    Commandline options are merged into `params` after they are parsed, so
+    you can also access them via `params`.
+
+    Explanation of options saved in `params`:
+
+        - best_train_loss: Best training loss so far. It is used to select
+                           the model that has the lowest training loss. It is
+                           updated during the training.
+
+        - best_valid_loss: Best validation loss so far. It is used to select
+                           the model that has the lowest validation loss. It is
+                           updated during the training.
+
+        - best_train_epoch: It is the epoch that has the best training loss.
+
+        - best_valid_epoch: It is the epoch that has the best validation loss.
+
+        - batch_idx_train: Used to writing statistics to tensorboard. It
+
+                           contains number of updates happen to the model so far across
+                           epochs.
+
+        - sub_batch_idx_train: It contains number of batch trained so far across
+                           epochs.
+
+        - log_interval:  Print training loss if batch_idx % log_interval` is 0
+
+        - reset_interval: Reset statistics if batch_idx % reset_interval is 0
+
+        - valid_interval:  Run validation if batch_idx % valid_interval is 0
+
+        - warm_step: The warmup period that dictates the decay of the
+              scale on "simple" (un-pruned) loss.
+    """
+    params = AttributeDict(
+        {
+            "best_train_loss": float("inf"),
+            "best_valid_loss": float("inf"),
+            "best_train_epoch": -1,
+            "best_valid_epoch": -1,
+            "batch_idx_train": 0,
+            "sub_batch_idx_train": 0,
+            "log_interval": 50,
+            "reset_interval": 200,
+            "valid_interval": 3000,  # For the 100h subset, use 800
+            # parameters for pruned RNN-T loss
+            "warm_step": 2000,
+            "env_info": get_env_info(),
+        }
+    )
+
+    return params
+
+
+def _to_int_tuple(s: Union[str, int, Tuple[int], list]) -> Tuple[int, ...]:
+    if isinstance(s, int):
+        return (int(s),)
+    if isinstance(s, (tuple, list)):
+        return tuple(int(v) for v in s)
+    parts = [p.strip() for p in str(s).split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"Expected at least one integer value, got: {s!r}")
+    return tuple(int(p) for p in parts)
+
+
+def _validate_streaming_config(params: AttributeDict) -> None:
+    """Validate streaming-related parameters for causal Zipformer training."""
+    if not bool(getattr(params, "enable_pre_asr_stream_routing", True)):
+        raise ValueError(
+            "Legacy post-encoder speaker split is removed in this project. "
+            "Set --enable-pre-asr-stream-routing=True."
+        )
+
+    if not bool(getattr(params, "causal", False)):
+        return
+
+    chunk_sizes = _to_int_tuple(params.chunk_size)
+    left_contexts = _to_int_tuple(params.left_context_frames)
+    downsampling = _to_int_tuple(params.downsampling_factor)
+    kernels = _to_int_tuple(params.cnn_module_kernel)
+
+    if len(downsampling) != len(kernels):
+        raise ValueError(
+            "downsampling-factor and cnn-module-kernel must have the same length: "
+            f"{len(downsampling)} vs {len(kernels)}"
+        )
+
+    if any(c <= 0 for c in chunk_sizes):
+        raise ValueError(
+            f"All --chunk-size values must be > 0 for streaming, got {chunk_sizes}"
+        )
+    if any(lc < 0 for lc in left_contexts):
+        raise ValueError(
+            f"All --left-context-frames values must be >= 0, got {left_contexts}"
+        )
+    if int(params.decode_chunk_len) <= 0:
+        raise ValueError(
+            f"--decode-chunk-len must be positive, got {params.decode_chunk_len}"
+        )
+    if int(params.short_chunk_size) <= 0:
+        raise ValueError(
+            f"--short-chunk-size must be positive, got {params.short_chunk_size}"
+        )
+    if int(params.chunk_size_frames) <= 0:
+        raise ValueError(
+            f"--chunk-size-frames must be positive, got {params.chunk_size_frames}"
+        )
+    if params.chunk_samples is not None and int(params.chunk_samples) <= 0:
+        raise ValueError(
+            f"--chunk-samples must be positive when set, got {params.chunk_samples}"
+        )
+
+    for lc in left_contexts:
+        for ds in downsampling:
+            if lc % ds != 0:
+                raise ValueError(
+                    "--left-context-frames must be divisible by every "
+                    f"downsampling factor for cache alignment; got {lc} with ds={ds}"
+                )
+
+    min_recommended_lc = max((k // 2) * ds for k, ds in zip(kernels, downsampling))
+    too_small_lc = [lc for lc in left_contexts if 0 < lc < min_recommended_lc]
+    if too_small_lc:
+        raise ValueError(
+            "left-context-frames too small for convolution receptive field: "
+            f"{too_small_lc}. Use >= {min_recommended_lc} (or 0 for strict no-left-context)."
+        )
+
+    decode_chunk_len = int(params.decode_chunk_len)
+    if decode_chunk_len not in chunk_sizes:
+        logging.warning(
+            "--decode-chunk-len=%s is not in --chunk-size=%s. "
+            "This may increase train/infer mismatch.",
+            decode_chunk_len,
+            chunk_sizes,
+        )
+
+
+
+def _infer_samples_per_frame(model: nn.Module) -> int:
+    """Infer samples_per_frame from model/frontend (same logic as _resolve_chunk_samples)."""
+    candidates = [
+        getattr(getattr(model, "_streaming_frontend", None), "samples_per_frame", None),
+        getattr(getattr(model, "encoder", None), "samples_per_frame", None),
+        getattr(getattr(model, "encoder", None), "subsampling_factor_in_samples", None),
+        getattr(getattr(getattr(model, "asr_model", None), "encoder", None), "samples_per_frame", None),
+        getattr(getattr(getattr(model, "asr_model", None), "encoder", None), "subsampling_factor_in_samples", None),
+    ]
+    for c in candidates:
+        if c is not None:
+            return int(c)
+    return 320  # Fallback for HuBERT default conv stride
+
+
+def _resolve_chunk_samples(
+    params: AttributeDict,
+    model: nn.Module,
+    chunk_size_frames: Optional[int] = None,
+) -> int:
+    if getattr(params, "chunk_samples", None) is not None:
+        chunk_samples = int(params.chunk_samples)
+    else:
+        samples_per_frame = None
+        candidates = [
+            getattr(getattr(model, "_streaming_frontend", None), "samples_per_frame", None),
+            getattr(getattr(model, "encoder", None), "samples_per_frame", None),
+            getattr(getattr(model, "encoder", None), "subsampling_factor_in_samples", None),
+            getattr(getattr(getattr(model, "asr_model", None), "encoder", None), "samples_per_frame", None),
+            getattr(getattr(getattr(model, "asr_model", None), "encoder", None), "subsampling_factor_in_samples", None),
+        ]
+        for candidate in candidates:
+            if candidate is not None:
+                samples_per_frame = int(candidate)
+                break
+
+        if samples_per_frame is None:
+            raise AttributeError(
+                "Unable to infer samples_per_frame from the encoder/frontend."
+            )
+        frames = (
+            int(chunk_size_frames)
+            if chunk_size_frames is not None and int(chunk_size_frames) > 0
+            else int(params.chunk_size.split(",")[0])
+        )
+        chunk_samples = frames * samples_per_frame
+
+    if chunk_samples <= 0:
+        raise ValueError(f"chunk_samples must be positive, got {chunk_samples}")
+    return chunk_samples
+
+
+def _sample_zipformer_chunk_config(
+    model: nn.Module,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Sample active chunk/left-context using Zipformer2's native logic.
+
+    Returns:
+      (chunk_size_frames, left_context_frames) where either item can be None
+      if sampling is unavailable or chunking is disabled.
+    """
+    zipformer = getattr(
+        getattr(getattr(model, "asr_model", None), "encoder", None),
+        "encoder",
+        None,
+    )
+    if zipformer is None or not getattr(zipformer, "causal", False):
+        return None, None
+
+    # Reuse upstream sampling logic exactly (random choice from configured lists).
+    chunk_size, left_context_chunks = zipformer.get_chunk_info()
+    if chunk_size <= 0 or left_context_chunks < 0:
+        return None, None
+
+    left_context_frames = int(chunk_size) * int(left_context_chunks)
+    return int(chunk_size), left_context_frames
+
+
+def _get_activity_teacher_forcing_ratio(
+    params: AttributeDict, is_training: bool
+) -> float:
+    if not is_training:
+        return 0.0
+
+    start = float(getattr(params, "activity_teacher_forcing", 0.0))
+    final = float(getattr(params, "activity_teacher_forcing_final", start))
+    warmup = int(getattr(params, "activity_teacher_forcing_warmup_steps", 0))
+    step = int(getattr(params, "batch_idx_train", 0))
+
+    if warmup <= 0 or step >= warmup:
+        return final
+
+    alpha = step / warmup
+    return start + alpha * (final - start)
+
+
+def get_encoder_model(params: AttributeDict) -> nn.Module:
+    if getattr(params, "pretrained_dir", None):
+        logging.info(f"Loading {params.pretrained_dir}")
+        pretrained = torch.load(params.pretrained_dir, weights_only=False)
+        encoder = HubertModel(params)
+        raw_state = pretrained["model"]
+
+        # Phase-2 checkpoint stores encoder under "asr_model.encoder.*".
+        # Strip the prefix so keys match HubertModel's own state_dict.
+        PREFIX = "asr_model.encoder."
+        if any(k.startswith(PREFIX) for k in raw_state):
+            state = {k[len(PREFIX):]: v for k, v in raw_state.items()
+                     if k.startswith(PREFIX)}
+            logging.info(
+                f"Stripped '{PREFIX}' prefix: {len(state)} encoder keys remapped"
+            )
+        else:
+            state = raw_state
+
+        missing, unexpected = encoder.load_state_dict(state, strict=False)
+        if missing:
+            logging.warning(
+                f"Pretrained encoder missing {len(missing)} keys "
+                f"(newly initialized): {missing[:5]}..."
+            )
+        if unexpected:
+            logging.warning(
+                f"Pretrained encoder has {len(unexpected)} unexpected keys "
+                f"(ignored): {unexpected[:5]}..."
+            )
+        logging.info(
+            f"Encoder loaded: {len(state) - len(missing)}/{len(state)} keys matched"
+        )
+    else:
+        encoder = HubertModel(params)
+    return encoder
+
+
+def get_decoder_model(params: AttributeDict) -> nn.Module:
+    decoder = Decoder(
+        vocab_size=params.vocab_size,
+        decoder_dim=params.decoder_dim,
+        blank_id=params.blank_id,
+        context_size=params.context_size,
+    )
+    return decoder
+
+
+def get_joiner_model(params: AttributeDict) -> nn.Module:
+    joiner = Joiner(
+        encoder_dim=max(_to_int_tuple(params.encoder_dim)),
+        decoder_dim=params.decoder_dim,
+        joiner_dim=params.joiner_dim,
+        vocab_size=params.vocab_size,
+    )
+    return joiner
+
+
+def get_model(params: AttributeDict) -> nn.Module:
+    assert params.use_transducer or params.use_ctc, (
+        f"At least one of them should be True, "
+        f"but got params.use_transducer={params.use_transducer}, "
+        f"params.use_ctc={params.use_ctc}"
+    )
+
+    encoder = get_encoder_model(params)
+
+    if params.use_transducer:
+        decoder = get_decoder_model(params)
+        joiner = get_joiner_model(params)
+    else:
+        decoder = None
+        joiner = None
+
+    model = AsrModel(
+        encoder=encoder,
+        decoder=decoder,
+        joiner=joiner,
+        encoder_dim=max(_to_int_tuple(params.encoder_dim)),
+        decoder_dim=params.decoder_dim,
+        vocab_size=params.vocab_size,
+        use_transducer=params.use_transducer,
+        use_ctc=params.use_ctc,
+    )
+    
+    if not bool(getattr(params, "enable_pre_asr_stream_routing", True)):
+        raise ValueError(
+            "Legacy post-encoder speaker split is removed in this project. "
+            "Set --enable-pre-asr-stream-routing=True."
+        )
+
+    ms_model = MultiSpeakerRnntModel(
+        asr_model=model,
+        num_speakers=params.num_speakers,
+        use_pyannote_diar=params.use_pyannote_diar,
+        pyannote_weight_dir=params.pyannote_weight_dir,
+        freeze_pyannote=params.freeze_pyannote,
+        enable_pre_asr_stream_routing=True,
+        pre_asr_active_threshold=params.pre_asr_active_threshold,
+        spk_kernel_dropout=params.spk_kernel_dropout,
+        bg_threshold=params.bg_threshold,
+    )
+
+    # Add KD feature-distillation projection heads if enabled.
+    # These are attached here (before checkpoint load) so they are part of the
+    # optimizer and can be saved/restored in checkpoints.
+    #   kd_fitnet_proj3: student stack3 [B,T,512] → teacher dim [B,T,256]
+    #   kd_mgd_proj5:    student stack5 [B,T,256] → teacher dim [B,T,256]
+    if getattr(params, "kd_fitnet_scale", 0.0) > 0.0 or getattr(
+        params, "kd_mgd_scale", 0.0
+    ) > 0.0:
+        if not hasattr(ms_model, "kd_fitnet_proj3"):
+            ms_model.kd_fitnet_proj3 = nn.Linear(512, 256)
+            logging.info("Added kd_fitnet_proj3: Linear(512 -> 256)")
+        if not hasattr(ms_model, "kd_mgd_proj5"):
+            ms_model.kd_mgd_proj5 = nn.Linear(256, 256)
+            logging.info("Added kd_mgd_proj5: Linear(256 -> 256)")
+
+    # Load vocab-dependent heads (decoder/joiner/ctc) from pretrained checkpoint.
+    # get_encoder_model() already loaded encoder keys (stripped prefix).
+    # Here we load the remaining keys (decoder, joiner, simple_*_proj, ctc_output)
+    # which are stored as "asr_model.*" and match the full model directly.
+    if getattr(params, "pretrained_dir", None):
+        pretrained = torch.load(params.pretrained_dir, map_location="cpu",
+                                weights_only=False)
+        raw_state = pretrained.get("model", pretrained)
+        # Only load non-encoder keys — encoder is already loaded in get_encoder_model
+        head_state = {k: v for k, v in raw_state.items()
+                      if not k.startswith("asr_model.encoder.")}
+        if head_state:
+            missing, unexpected = ms_model.load_state_dict(head_state, strict=False)
+            # `missing` = ALL model keys not in head_state (includes encoder keys we
+            # intentionally excluded). Count only head_state keys that failed to load.
+            head_keys = set(head_state.keys())
+            not_loaded = [k for k in missing if k in head_keys]
+            loaded = len(head_state) - len(not_loaded)
+            logging.info(
+                f"Head weights loaded from pretrained: {loaded}/{len(head_state)} keys"
+            )
+            if not_loaded:
+                logging.warning(f"Head keys not loaded (random init): {not_loaded}")
+
+    # Freeze encoder if requested (let decoder/joiner/CTC learn first)
+    if getattr(params, "freeze_encoder", False):
+        frozen_count = 0
+        for name, p in ms_model.named_parameters():
+            # Freeze: HuBERT conv frontend + zipformer encoder
+            # Keep trainable: decoder, joiner, ctc_output, spk_kernels
+            if name.startswith("asr_model.encoder."):
+                p.requires_grad = False
+                frozen_count += 1
+        trainable = sum(1 for p in ms_model.parameters() if p.requires_grad)
+        total = sum(1 for p in ms_model.parameters())
+        logging.info(
+            f"Froze encoder: {frozen_count} params frozen, "
+            f"{trainable}/{total} params trainable"
+        )
+
+    return ms_model
+
+
+def load_checkpoint_if_available(
+    params: AttributeDict,
+    model: nn.Module,
+    model_avg: nn.Module = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[LRSchedulerType] = None,
+) -> Optional[Dict[str, Any]]:
+    """Load checkpoint from file.
+
+    If params.start_batch is positive, it will load the checkpoint from
+    `params.exp_dir/checkpoint-{params.start_batch}.pt`. Otherwise, if
+    params.start_epoch is larger than 1, it will load the checkpoint from
+    `params.start_epoch - 1`.
+
+    Apart from loading state dict for `model` and `optimizer` it also updates
+    `best_train_epoch`, `best_train_loss`, `best_valid_epoch`,
+    and `best_valid_loss` in `params`.
+
+    Args:
+      params:
+        The return value of :func:`get_params`.
+      model:
+        The training model.
+      model_avg:
+        The stored model averaged from the start of training.
+      optimizer:
+        The optimizer that we are using.
+      scheduler:
+        The scheduler that we are using.
+    Returns:
+      Return a dict containing previously saved training info.
+    """
+    if params.start_batch > 0:
+        filename = params.exp_dir / f"checkpoint-{params.start_batch}.pt"
+    elif params.start_epoch > 1:
+        filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
+    else:
+        return None
+
+    assert filename.is_file(), f"{filename} does not exist!"
+
+    saved_params = load_checkpoint(
+        filename,
+        model=model,
+        model_avg=model_avg,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+
+    keys = [
+        "best_train_epoch",
+        "best_valid_epoch",
+        "batch_idx_train",
+        "best_train_loss",
+        "best_valid_loss",
+    ]
+    for k in keys:
+        params[k] = saved_params[k]
+
+    if params.start_batch > 0:
+        if "cur_epoch" in saved_params:
+            params["start_epoch"] = saved_params["cur_epoch"]
+
+    return saved_params
+
+
+def save_checkpoint(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    model_avg: Optional[nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[LRSchedulerType] = None,
+    sampler: Optional[CutSampler] = None,
+    scaler: Optional[GradScaler] = None,
+    rank: int = 0,
+) -> None:
+    """Save model, optimizer, scheduler and training stats to file.
+
+    Args:
+      params:
+        It is returned by :func:`get_params`.
+      model:
+        The training model.
+      model_avg:
+        The stored model averaged from the start of training.
+      optimizer:
+        The optimizer used in the training.
+      sampler:
+       The sampler for the training dataset.
+      scaler:
+        The scaler used for mix precision training.
+    """
+    if rank != 0:
+        return
+    filename = params.exp_dir / f"epoch-{params.cur_epoch}.pt"
+    save_checkpoint_impl(
+        filename=filename,
+        model=model,
+        model_avg=model_avg,
+        params=params,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=sampler,
+        scaler=scaler,
+        rank=rank,
+    )
+
+    if params.best_train_epoch == params.cur_epoch:
+        best_train_filename = params.exp_dir / "best-train-loss.pt"
+        copyfile(src=filename, dst=best_train_filename)
+
+    if params.best_valid_epoch == params.cur_epoch:
+        best_valid_filename = params.exp_dir / "best-valid-loss.pt"
+        copyfile(src=filename, dst=best_valid_filename)
+
+
+def compute_loss(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    sp: TokenEncoder,
+    batch: dict,
+    is_training: bool,
+    kd_teacher=None,
+    kd_teacher_py=None,
+) -> Tuple[Tensor, MetricsTracker]:
+    """
+    Compute loss given the model and its inputs.
+
+    Args:
+      params:
+        Parameters for training. See :func:`get_params`.
+      model:
+        The model for training. It is an instance of Zipformer in our case.
+      batch:
+        A batch of data. See `dataset.HubertAsrDataset()`
+        for the content in it.
+      is_training:
+        True for training. False for validation. When it is True, this
+        function enables autograd during computation; when it is False, it
+        disables autograd.
+     warmup: a floating point value which increases throughout training;
+        values >= 1.0 are fully warmed up and have all modules present.
+    """
+    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    audio = batch["audio"]
+    if audio.device != device:
+        audio = audio.to(device, non_blocking=True)
+    raw_audio = batch.get("raw_audio")
+    if raw_audio is not None and raw_audio.device != device:
+        raw_audio = raw_audio.to(device, non_blocking=True)
+    padding_mask = batch["padding_mask"]
+    if padding_mask.device != device:
+        padding_mask = padding_mask.to(device, non_blocking=True)
+
+    batch_idx_train = params.batch_idx_train
+    warm_step = params.warm_step
+    base_model = model.module if isinstance(model, DDP) else model
+
+    # Set delay_penalty on the model (only after warmup)
+    warmup_ratio = float(batch_idx_train) / max(warm_step, 1)
+    base_model._delay_penalty = params.delay_penalty if warmup_ratio >= 2.0 else 0.0
+
+    # Phase 2: process ground truth lists of texts per speaker
+    y_texts = batch["y_texts"] # List[List[str]] of length S
+    y_per_speaker = []
+
+    total_targets = 0
+    empty_targets = 0
+    total_target_len = 0
+    for texts in y_texts:
+        y = sp.encode(texts, out_type=int)
+        for seq in y:
+            total_targets += 1
+            if len(seq) == 0:
+                empty_targets += 1
+            total_target_len += len(seq)
+        y = k2.RaggedTensor(y)
+        y_per_speaker.append(y)
+
+    oracle_activity = batch["spk_activity"]
+    if oracle_activity.device != device:
+        oracle_activity = oracle_activity.to(device, non_blocking=True)
+    routing_activity = oracle_activity
+    pyannote_phase = int(getattr(params, "pyannote_phase", 1))
+    diar_head = getattr(base_model, "pyannote_diar", None)
+    if pyannote_phase >= 2 and diar_head is not None:
+        if raw_audio is None:
+            raise RuntimeError(
+                "raw_audio is required when --pyannote-phase >= 2 and pyannote diar is enabled."
+            )
+        with torch.no_grad():
+            routing_activity = diar_head(
+                raw_audio, target_len=int(oracle_activity.shape[1])
+            )
+        routing_activity = routing_activity.to(
+            device=device, dtype=oracle_activity.dtype
+        )
+
+    target_speaker_ids = None
+    if getattr(params, "ssa_single_target", False):
+        target_speaker_ids = batch["target_speaker_ids"]
+        if target_speaker_ids.device != device:
+            target_speaker_ids = target_speaker_ids.to(device, non_blocking=True)
+
+    kd_objective = str(getattr(params, "kd_objective", "ctc")).lower()
+    decoder_ce_scale = float(getattr(params, "decoder_ce_scale", 0.0))
+    joiner_ce_scale = float(getattr(params, "joiner_ce_scale", 0.0))
+    joiner_kd_scale = float(getattr(params, "joiner_kd_scale", 0.0))
+    kd_log_raw_nonblank = bool(getattr(params, "kd_log_raw_nonblank", True))
+    kd_log_on_valid = (not is_training) and bool(getattr(params, "kd_log_on_valid", True))
+    kd_metrics_enabled = is_training or kd_log_on_valid
+    use_kd_ctc = (
+        kd_teacher is not None
+        and kd_metrics_enabled
+        and getattr(params, "kd_loss_scale", 0.0) > 0.0
+        and getattr(params, "use_ctc", False)
+        and kd_objective in ("ctc", "both")
+    )
+    use_kd_rnnt = (
+        kd_teacher is not None
+        and kd_metrics_enabled
+        and getattr(params, "kd_loss_scale", 0.0) > 0.0
+        and getattr(params, "use_transducer", False)
+        and kd_objective in ("rnnt", "both")
+    )
+    use_kd_joiner = (
+        kd_teacher is not None
+        and kd_metrics_enabled
+        and getattr(params, "use_transducer", False)
+        and kd_objective in ("rnnt", "both")
+    )
+    need_student_rnnt_aux = (
+        kd_metrics_enabled
+        and getattr(params, "use_transducer", False)
+        and (
+            use_kd_rnnt
+            or use_kd_joiner
+            or (is_training and decoder_ce_scale > 0.0)
+            or (is_training and joiner_ce_scale > 0.0)
+        )
+    )
+
+    student_ctc_logits = None
+    student_enc_lens = None
+    student_rnnt_am_logits = None
+    student_rnnt_lm_logits = None
+    student_decoder_input_ids = None
+    student_target_lens = None
+    student_encoder_out = None
+    student_decoder_out = None
+
+    with torch.set_grad_enabled(is_training):
+        if hasattr(base_model, "forward_train_routing"):
+            fwd_out = base_model.forward_train_routing(
+                source=audio,
+                y_per_speaker=y_per_speaker,
+                spk_activity=routing_activity,
+                padding_mask=padding_mask,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+                target_speaker_ids=target_speaker_ids,
+                return_ctc_logits=use_kd_ctc,
+                return_rnnt_simple_logits=need_student_rnnt_aux,
+            )
+            if use_kd_ctc or need_student_rnnt_aux:
+                simple_loss, pruned_loss, ctc_loss, kd_outputs = fwd_out
+                student_ctc_logits = kd_outputs.get("student_ctc_logits")
+                student_enc_lens = kd_outputs.get("student_enc_lens")
+                student_rnnt_am_logits = kd_outputs.get("student_rnnt_am_logits")
+                student_rnnt_lm_logits = kd_outputs.get("student_rnnt_lm_logits")
+                student_decoder_input_ids = kd_outputs.get("student_decoder_input_ids")
+                student_target_lens = kd_outputs.get("student_target_lens")
+                student_encoder_out = kd_outputs.get("student_encoder_out")
+                student_decoder_out = kd_outputs.get("student_decoder_out")
+            else:
+                simple_loss, pruned_loss, ctc_loss = fwd_out
+        else:
+            # Backward compatibility for legacy/lightweight test mocks.
+            chunk_size_frames, left_context_frames = _sample_zipformer_chunk_config(
+                base_model
+            )
+            chunk_samples = _resolve_chunk_samples(
+                params,
+                base_model,
+                chunk_size_frames=chunk_size_frames,
+            )
+            teacher_forcing_ratio = _get_activity_teacher_forcing_ratio(
+                params, is_training=is_training
+            )
+            (simple_loss, pruned_loss, ctc_loss) = (
+                base_model.chunked_forward_train_streaming(
+                    source=audio,
+                    y_per_speaker=y_per_speaker,
+                    spk_activity=routing_activity,
+                    teacher_activity=routing_activity,
+                    padding_mask=padding_mask,
+                    chunk_samples=chunk_samples,
+                    chunk_size_frames=chunk_size_frames,
+                    left_context_frames=left_context_frames,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                    activity_teacher_forcing_ratio=teacher_forcing_ratio,
+                    raw_audio=raw_audio,
+                    target_speaker_ids=target_speaker_ids,
+                )
+            )
+
+        # Use encoder frames (not raw samples) for metric normalization
+        num_samples = (~padding_mask).long().sum()
+        samples_per_frame = _infer_samples_per_frame(base_model)
+        num_frames = num_samples // samples_per_frame
+
+        loss = 0.0
+
+        # CTC-only warmup: disable transducer loss for first N steps
+        ctc_only = (
+            params.ctc_only_steps > 0
+            and batch_idx_train < params.ctc_only_steps
+        )
+
+        if params.use_transducer and not ctc_only:
+            s = params.simple_loss_scale
+            simple_loss_scale = (
+                s
+                if batch_idx_train >= warm_step
+                else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
+            )
+            pruned_loss_scale = (
+                1.0
+                if batch_idx_train >= warm_step
+                else 0.1 + 0.9 * (batch_idx_train / warm_step)
+            )
+            loss += simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+
+        if params.use_ctc:
+            # During CTC-only phase, scale up CTC to be the primary loss
+            ctc_scale = 1.0 if ctc_only else params.ctc_loss_scale
+            loss += ctc_scale * ctc_loss
+
+        # ---- Phase schedule -----------------------------------------------
+        # Phase A (0 .. kd_phase_a_steps):        FitNet only
+        # Phase B (kd_phase_a_steps .. kd_phase_b_steps): FitNet + MGD + logit-KD warmup
+        # Phase C (kd_phase_b_steps .. ):         all three at full scale
+        kd_phase_a = int(getattr(params, "kd_phase_a_steps", 5000))
+        kd_phase_b = int(getattr(params, "kd_phase_b_steps", 15000))
+        step = int(batch_idx_train)
+
+        fitnet_active = step >= 0                            # Phase A+
+        mgd_active    = step >= kd_phase_a                  # Phase B+
+        if step < kd_phase_a:
+            kd_logit_scale_factor = 0.0
+        elif step < kd_phase_b:
+            kd_logit_scale_factor = (step - kd_phase_a) / max(kd_phase_b - kd_phase_a, 1)
+        else:
+            kd_logit_scale_factor = 1.0
+        should_compute_kd_logits = kd_logit_scale_factor > 0.0 or kd_log_on_valid
+
+        blank_id = int(getattr(params, "blank_id", 0))
+        kd_rnnt_raw_val = None
+        kd_rnnt_nonblank_raw_val = None
+        kd_joiner_raw_val = None
+        kd_joiner_nonblank_raw_val = None
+
+        # ---- CTC logit distillation ----------------------------------------
+        kd_dkd_loss_val = 0.0
+        if use_kd_ctc and student_ctc_logits is not None and should_compute_kd_logits:
+            from kd_loss import ctc_kd_loss
+            with torch.no_grad():
+                teacher_logits, _t_lens = kd_teacher.get_ctc_logits(
+                    audio=audio,
+                    padding_mask=padding_mask,
+                )
+                teacher_logits = kd_teacher.map_to_student_vocab(teacher_logits)
+            kd = ctc_kd_loss(
+                student_logits=student_ctc_logits,
+                teacher_logits=teacher_logits,
+                student_lens=student_enc_lens,
+                temperature=params.kd_temperature,
+            )
+            if is_training and kd_logit_scale_factor > 0.0:
+                loss += params.kd_loss_scale * kd_logit_scale_factor * kd
+            kd_dkd_loss_val = kd.detach().cpu().item()
+
+        # ---- RNNT simple-branch distillation -------------------------------
+        kd_rnnt_loss_val = 0.0
+        if (
+            use_kd_rnnt
+            and student_rnnt_am_logits is not None
+            and student_rnnt_lm_logits is not None
+            and student_enc_lens is not None
+            and student_decoder_input_ids is not None
+            and student_target_lens is not None
+            and should_compute_kd_logits
+        ):
+            from kd_loss import rnnt_kd_loss
+
+            with torch.no_grad():
+                teacher_am_logits, teacher_lm_logits, _t_lens = kd_teacher.get_rnnt_simple_logits(
+                    audio=audio,
+                    padding_mask=padding_mask,
+                    decoder_input_ids=student_decoder_input_ids,
+                )
+                teacher_am_logits = kd_teacher.map_to_student_vocab(teacher_am_logits)
+                teacher_lm_logits = kd_teacher.map_to_student_vocab(teacher_lm_logits)
+
+            kd_rnnt = rnnt_kd_loss(
+                student_am_logits=student_rnnt_am_logits,
+                student_lm_logits=student_rnnt_lm_logits,
+                teacher_am_logits=teacher_am_logits,
+                teacher_lm_logits=teacher_lm_logits,
+                student_enc_lens=student_enc_lens,
+                target_lens=student_target_lens,
+                temperature=params.kd_temperature,
+                # Teacher simple_am_proj has degenerate bias[<unk>]=80 →
+                # AM-only distribution is always <unk> with ~100% confidence.
+                # Skip AM branch to avoid corrupting student encoder via backprop.
+                # Use joiner_diag_kd_loss (JOINER_KD_SCALE) for acoustic KD.
+                skip_am_branch=True,
+            )
+            if is_training and kd_logit_scale_factor > 0.0:
+                loss += params.kd_loss_scale * kd_logit_scale_factor * kd_rnnt
+            kd_rnnt_loss_val = kd_rnnt.detach().cpu().item()
+            kd_rnnt_raw_val = kd_rnnt_loss_val
+
+            if kd_log_raw_nonblank:
+                with torch.no_grad():
+                    kd_rnnt_nonblank = rnnt_kd_loss(
+                        student_am_logits=student_rnnt_am_logits.detach(),
+                        student_lm_logits=student_rnnt_lm_logits.detach(),
+                        teacher_am_logits=teacher_am_logits,
+                        teacher_lm_logits=teacher_lm_logits,
+                        student_enc_lens=student_enc_lens,
+                        target_lens=student_target_lens,
+                        temperature=params.kd_temperature,
+                        ignore_blank_id=blank_id,
+                        skip_am_branch=True,
+                    )
+                kd_rnnt_nonblank_raw_val = kd_rnnt_nonblank.detach().cpu().item()
+
+        # ---- Joiner diagonal distillation (teacher vs student) --------------
+        kd_joiner_loss_val = None
+        if (
+            use_kd_joiner
+            and student_enc_lens is not None
+            and student_encoder_out is not None
+            and student_decoder_out is not None
+            and student_decoder_input_ids is not None
+            and student_target_lens is not None
+        ):
+            from kd_loss import joiner_diag_kd_loss
+
+            with torch.no_grad():
+                teacher_joiner_logits, _t_lens = kd_teacher.get_joiner_diag_logits(
+                    audio=audio,
+                    padding_mask=padding_mask,
+                    decoder_input_ids=student_decoder_input_ids,
+                    target_lens=student_target_lens,
+                )
+                teacher_joiner_logits = kd_teacher.map_to_student_vocab(teacher_joiner_logits)
+
+            joiner_mod = None
+            if hasattr(base_model, "asr_model") and hasattr(base_model.asr_model, "joiner"):
+                joiner_mod = base_model.asr_model.joiner
+            elif hasattr(base_model, "joiner"):
+                joiner_mod = base_model.joiner
+
+            if joiner_mod is not None:
+                B, T, _ = student_encoder_out.shape
+                U = student_decoder_out.shape[1]
+
+                valid_t = student_enc_lens.to(dtype=torch.long).clamp(max=T)
+                valid_u = (student_target_lens.to(dtype=torch.long) + 1).clamp(max=U)
+
+                t_index = torch.arange(T, device=student_encoder_out.device).unsqueeze(0).expand(B, -1)
+                denom_t = valid_t.unsqueeze(1).clamp(min=1)
+                u_index = (t_index * valid_u.unsqueeze(1)) // denom_t
+                u_index = torch.minimum(u_index, (valid_u.unsqueeze(1) - 1).clamp(min=0))
+                u_index = u_index.clamp(min=0, max=U - 1)
+
+                dec_diag = student_decoder_out.gather(
+                    dim=1,
+                    index=u_index.unsqueeze(-1).expand(-1, -1, student_decoder_out.size(-1)),
+                )
+                student_joiner_logits = joiner_mod(
+                    student_encoder_out,
+                    dec_diag,
+                    project_input=True,
+                )
+
+                kd_joiner = joiner_diag_kd_loss(
+                    student_joiner_logits=student_joiner_logits,
+                    teacher_joiner_logits=teacher_joiner_logits,
+                    student_enc_lens=student_enc_lens,
+                    temperature=params.kd_temperature,
+                )
+
+                kd_joiner_raw_val = kd_joiner.detach().cpu().item()
+
+                if kd_log_raw_nonblank:
+                    with torch.no_grad():
+                        kd_joiner_nonblank = joiner_diag_kd_loss(
+                            student_joiner_logits=student_joiner_logits.detach(),
+                            teacher_joiner_logits=teacher_joiner_logits,
+                            student_enc_lens=student_enc_lens,
+                            temperature=params.kd_temperature,
+                            ignore_blank_id=blank_id,
+                        )
+                    kd_joiner_nonblank_raw_val = kd_joiner_nonblank.detach().cpu().item()
+
+                if is_training and joiner_kd_scale > 0.0 and kd_logit_scale_factor > 0.0:
+                    loss += joiner_kd_scale * kd_logit_scale_factor * kd_joiner
+
+                kd_joiner_loss_val = kd_joiner.detach().cpu().item()
+
+        # ---- Decoder-end auxiliary CE loss (debug/optional optimization) ----
+        decoder_aux_ce_val = None
+        if (
+            need_student_rnnt_aux
+            and student_rnnt_lm_logits is not None
+            and student_decoder_input_ids is not None
+            and student_target_lens is not None
+        ):
+            # Decoder LM logits are length U = target_len + 1 (SOS context steps).
+            # Supervise next-token prediction: shift decoder inputs left and append blank.
+            B, U, V = student_rnnt_lm_logits.shape
+            lm_targets = torch.full(
+                (B, U),
+                blank_id,
+                dtype=torch.long,
+                device=student_rnnt_lm_logits.device,
+            )
+            if U > 1:
+                lm_targets[:, : U - 1] = student_decoder_input_ids[:, 1:U]
+
+            ce_per_token = torch.nn.functional.cross_entropy(
+                student_rnnt_lm_logits.reshape(-1, V),
+                lm_targets.reshape(-1),
+                reduction="none",
+            ).reshape(B, U)
+
+            valid_u = (student_target_lens.to(dtype=torch.long) + 1).clamp(max=U)
+            mask = (
+                torch.arange(U, device=valid_u.device).unsqueeze(0)
+                < valid_u.unsqueeze(1)
+            )
+            ce = (ce_per_token * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+
+            if is_training and decoder_ce_scale > 0.0:
+                loss += decoder_ce_scale * ce
+
+            decoder_aux_ce_val = ce.detach().cpu().item()
+
+        # ---- Joiner-end auxiliary CE loss on a monotonic diagonal path -------
+        joiner_aux_ce_val = None
+        joiner_mod = None
+        if hasattr(base_model, "asr_model") and hasattr(base_model.asr_model, "joiner"):
+            joiner_mod = base_model.asr_model.joiner
+        elif hasattr(base_model, "joiner"):
+            joiner_mod = base_model.joiner
+
+        if (
+            need_student_rnnt_aux
+            and joiner_mod is not None
+            and student_encoder_out is not None
+            and student_decoder_out is not None
+            and student_decoder_input_ids is not None
+            and student_target_lens is not None
+            and student_enc_lens is not None
+        ):
+            B, T, _ = student_encoder_out.shape
+            U = student_decoder_out.shape[1]
+
+            # Same next-token targets as decoder aux CE, but projected onto time axis.
+            joiner_targets_u = torch.full(
+                (B, U),
+                blank_id,
+                dtype=torch.long,
+                device=student_decoder_input_ids.device,
+            )
+            if U > 1:
+                joiner_targets_u[:, : U - 1] = student_decoder_input_ids[:, 1:U]
+
+            valid_t = student_enc_lens.to(dtype=torch.long).clamp(max=T)
+            valid_u = (student_target_lens.to(dtype=torch.long) + 1).clamp(max=U)
+
+            t_index = torch.arange(T, device=student_encoder_out.device).unsqueeze(0).expand(B, -1)
+            denom_t = valid_t.unsqueeze(1).clamp(min=1)
+            u_index = (t_index * valid_u.unsqueeze(1)) // denom_t
+            u_index = torch.minimum(u_index, (valid_u.unsqueeze(1) - 1).clamp(min=0))
+            u_index = u_index.clamp(min=0, max=U - 1)
+
+            dec_diag = student_decoder_out.gather(
+                dim=1,
+                index=u_index.unsqueeze(-1).expand(-1, -1, student_decoder_out.size(-1)),
+            )
+            joiner_logits_diag = joiner_mod(
+                student_encoder_out,
+                dec_diag,
+                project_input=True,
+            )
+
+            frame_targets = joiner_targets_u.gather(1, u_index)
+            vocab_size = int(joiner_logits_diag.size(-1))
+            ce_per_frame = torch.nn.functional.cross_entropy(
+                joiner_logits_diag.reshape(-1, vocab_size),
+                frame_targets.reshape(-1),
+                reduction="none",
+            ).reshape(B, T)
+
+            t_mask = (
+                torch.arange(T, device=valid_t.device).unsqueeze(0)
+                < valid_t.unsqueeze(1)
+            )
+            joiner_ce = (ce_per_frame * t_mask.float()).sum() / t_mask.float().sum().clamp(min=1.0)
+
+            if is_training and joiner_ce_scale > 0.0:
+                loss += joiner_ce_scale * joiner_ce
+
+            joiner_aux_ce_val = joiner_ce.detach().cpu().item()
+
+        # ---- FitNet / MGD feature distillation ----------------------------
+        kd_fitnet_scale = float(getattr(params, "kd_fitnet_scale", 0.0))
+        kd_mgd_scale    = float(getattr(params, "kd_mgd_scale", 0.0))
+        kd_fitnet_loss_val = 0.0
+        kd_mgd_loss_val    = 0.0
+        kd_fitnet_raw_val = None
+        kd_mgd_raw_val = None
+
+        if (
+            kd_teacher_py is not None
+            and (is_training or kd_log_on_valid)
+            and (
+                (kd_fitnet_scale > 0.0 and fitnet_active)
+                or (kd_mgd_scale > 0.0 and mgd_active)
+            )
+            and hasattr(base_model, "forward_kd_features")
+            and hasattr(base_model, "kd_fitnet_proj3")
+            and hasattr(base_model, "kd_mgd_proj5")
+        ):
+            from kd_loss import fitnet_loss, mgd_loss
+
+            # Teacher full-context features (no grad, teacher is frozen)
+            with torch.no_grad():
+                (
+                    t_logits,
+                    t_stack3,
+                    t_stack5,
+                    _t_lens2,
+                ) = kd_teacher_py.get_features_and_logits(
+                    audio=audio,
+                    padding_mask=padding_mask,
+                )
+
+            # Student features WITHOUT SpeakerKernel (content-matched to teacher)
+            s_stack3, s_stack5, _s_enc, s_enc_lens = base_model.forward_kd_features(
+                source=audio,
+                padding_mask=padding_mask,
+            )
+
+            if kd_fitnet_scale > 0.0 and fitnet_active:
+                fl = fitnet_loss(
+                    student_feat=s_stack3,
+                    teacher_feat=t_stack3,
+                    proj_head=base_model.kd_fitnet_proj3,
+                    student_lens=s_enc_lens,
+                )
+                if is_training:
+                    loss += kd_fitnet_scale * fl
+                kd_fitnet_loss_val = fl.detach().cpu().item()
+                kd_fitnet_raw_val = kd_fitnet_loss_val
+
+            if kd_mgd_scale > 0.0 and mgd_active:
+                ml = mgd_loss(
+                    student_feat=s_stack5,
+                    teacher_feat=t_stack5,
+                    proj_head=base_model.kd_mgd_proj5,
+                    student_lens=s_enc_lens,
+                    mask_ratio=float(getattr(params, "kd_mgd_mask_ratio", 0.75)),
+                )
+                if is_training:
+                    loss += kd_mgd_scale * ml
+                kd_mgd_loss_val = ml.detach().cpu().item()
+                kd_mgd_raw_val = kd_mgd_loss_val
+
+    assert loss.requires_grad == is_training
+
+    info = MetricsTracker()
+    num_frames_float = float(num_frames.item()) if hasattr(num_frames, "item") else float(num_frames)
+    if kd_dkd_loss_val:
+        info["kd_dkd_loss"] = kd_dkd_loss_val
+    if kd_rnnt_loss_val:
+        info["kd_rnnt_loss"] = kd_rnnt_loss_val
+    if kd_rnnt_raw_val is not None:
+        info["kd_rnnt_raw"] = kd_rnnt_raw_val * num_frames_float
+    if kd_rnnt_nonblank_raw_val is not None:
+        info["kd_rnnt_nonblank_raw"] = kd_rnnt_nonblank_raw_val * num_frames_float
+    if kd_joiner_loss_val is not None:
+        info["kd_joiner_loss"] = kd_joiner_loss_val
+    if kd_joiner_raw_val is not None:
+        info["kd_joiner_raw"] = kd_joiner_raw_val * num_frames_float
+    if kd_joiner_nonblank_raw_val is not None:
+        info["kd_joiner_nonblank_raw"] = kd_joiner_nonblank_raw_val * num_frames_float
+    if decoder_aux_ce_val is not None:
+        info["decoder_aux_ce_loss"] = decoder_aux_ce_val
+    if joiner_aux_ce_val is not None:
+        info["joiner_aux_ce_loss"] = joiner_aux_ce_val
+    if kd_fitnet_loss_val:
+        info["kd_fitnet_loss"] = kd_fitnet_loss_val
+    if kd_fitnet_raw_val is not None:
+        info["kd_fitnet_raw"] = kd_fitnet_raw_val * num_frames_float
+    if kd_mgd_loss_val:
+        info["kd_mgd_loss"] = kd_mgd_loss_val
+    if kd_mgd_raw_val is not None:
+        info["kd_mgd_raw"] = kd_mgd_raw_val * num_frames_float
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        info["frames"] = num_frames.item()
+
+    info["loss"] = loss.detach().cpu().item()
+    if params.use_transducer:
+        info["simple_loss"] = simple_loss.detach().cpu().item()
+        info["pruned_loss"] = pruned_loss.detach().cpu().item()
+
+    if params.use_ctc:
+        info["ctc_loss"] = ctc_loss.detach().cpu().item()
+
+    # Diagnostic: track target quality.
+    # NOTE: MetricsTracker.__str__ normalizes all non-"utt_" metrics by frames.
+    # To make these diagnostics human-readable in logs, we pre-scale by frames
+    # so the printed value remains the true ratio/mean instead of a tiny value.
+    if total_targets > 0:
+        empty_target_ratio = empty_targets / total_targets
+        target_len_mean = total_target_len / max(total_targets - empty_targets, 1)
+        info["empty_target_ratio"] = empty_target_ratio * num_frames_float
+        info["target_len_mean"] = target_len_mean * num_frames_float
+
+    return loss, info
+
+
+def compute_validation_loss(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    sp: TokenEncoder,
+    valid_dl: torch.utils.data.DataLoader,
+    world_size: int = 1,
+    kd_teacher=None,
+    kd_teacher_py=None,
+) -> MetricsTracker:
+    """Run the validation process."""
+    model.eval()
+
+    tot_loss = MetricsTracker()
+
+    for batch_idx, batch in enumerate(valid_dl):
+        loss, loss_info = compute_loss(
+            params=params,
+            model=model,
+            sp=sp,
+            batch=batch,
+            is_training=False,
+            kd_teacher=kd_teacher,
+            kd_teacher_py=kd_teacher_py,
+        )
+        assert loss.requires_grad is False
+        tot_loss = tot_loss + loss_info
+
+    if world_size > 1:
+        tot_loss.reduce(loss.device)
+
+    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    if loss_value < params.best_valid_loss:
+        params.best_valid_epoch = params.cur_epoch
+        params.best_valid_loss = loss_value
+
+    return tot_loss
+
+
+def train_one_epoch(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    optimizer: torch.optim.Optimizer,
+    scheduler: LRSchedulerType,
+    sp: TokenEncoder,
+    train_dl: torch.utils.data.DataLoader,
+    valid_dl: torch.utils.data.DataLoader,
+    scaler: GradScaler,
+    model_avg: Optional[nn.Module] = None,
+    tb_writer: Optional[SummaryWriter] = None,
+    world_size: int = 1,
+    rank: int = 0,
+    kd_teacher=None,
+    kd_teacher_py=None,
+) -> None:
+    """Train the model for one epoch.
+
+    The training loss from the mean of all frames is saved in
+    `params.train_loss`. It runs the validation process every
+    `params.valid_interval` batches.
+
+    Args:
+      params:
+        It is returned by :func:`get_params`.
+      model:
+        The model for training.
+      optimizer:
+        The optimizer we are using.
+      scheduler:
+        The learning rate scheduler, we call step() every step.
+      train_dl:
+        Dataloader for the training dataset.
+      valid_dl:
+        Dataloader for the validation dataset.
+      scaler:
+        The scaler used for mix precision training.
+      model_avg:
+        The stored model averaged from the start of training.
+      tb_writer:
+        Writer to write log messages to tensorboard.
+      world_size:
+        Number of nodes in DDP training. If it is 1, DDP is disabled.
+      rank:
+        The rank of the node in DDP training. If no DDP is used, it should
+        be set to 0.
+    """
+    model.train()
+
+    tot_loss = MetricsTracker()
+
+    saved_bad_model = False
+
+    def save_bad_model(suffix: str = ""):
+        save_checkpoint_impl(
+            filename=params.exp_dir / f"bad-model{suffix}-{rank}.pt",
+            model=model,
+            model_avg=model_avg,
+            params=params,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sampler=train_dl.sampler,
+            scaler=scaler,
+            rank=0,
+        )
+
+    # Pre-transfer tensors to GPU using a separate CUDA stream so that
+    # host→device copies overlap with the previous step's compute.
+    device = next(model.parameters()).device
+    _xfer_stream = torch.cuda.Stream(device) if device.type == "cuda" else None
+    _tensor_keys = ("audio", "raw_audio", "padding_mask", "spk_activity", "target_speaker_ids")
+
+    def _prefetch_batch(batch):
+        """Move tensor fields to GPU on a side stream (non-blocking)."""
+        if _xfer_stream is None:
+            return batch
+        with torch.cuda.stream(_xfer_stream):
+            for k in _tensor_keys:
+                v = batch.get(k)
+                if v is not None and isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device, non_blocking=True)
+        return batch
+
+    def _sync_batch():
+        """Wait for prefetch transfers to finish before compute."""
+        if _xfer_stream is not None:
+            torch.cuda.current_stream(device).wait_stream(_xfer_stream)
+
+    for sub_batch_idx, batch in enumerate(train_dl):
+        batch = _prefetch_batch(batch)
+        params.sub_batch_idx_train += 1
+        batch_idx = sub_batch_idx // params.accum_grad
+
+        if batch_idx % 10 == 0:
+            set_batch_count(model, get_adjusted_batch_count(params))
+
+        batch_size = batch["audio"].shape[0]
+
+        try:
+            _sync_batch()  # ensure prefetch transfers are complete
+            amp_enabled = params.use_fp16 or params.use_bf16
+            amp_dtype = torch.bfloat16 if params.use_bf16 else None
+            amp_kwargs = dict(enabled=amp_enabled)
+            if amp_dtype is not None:
+                amp_kwargs["dtype"] = amp_dtype
+            with torch_autocast(**amp_kwargs):
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=True,
+                    kd_teacher=kd_teacher,
+                    kd_teacher_py=kd_teacher_py,
+                )
+            # summary stats
+            tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
+
+            # NOTE: We use reduction==sum and loss is computed over utterances
+            # in the batch and there is no normalization to it so far.
+            scaler.scale(loss / params.accum_grad).backward()
+
+            if sub_batch_idx % params.accum_grad == params.accum_grad - 1:
+                params.batch_idx_train += 1
+                scheduler.step_batch(params.batch_idx_train)
+
+                # Skip batches that produced NaN/Inf gradients to avoid
+                # corrupting the ScaledAdam model_norms ring buffer.
+                has_nan_grad = False
+                if scaler.get_scale() > 0:
+                    scaler.unscale_(optimizer)
+                    has_nan_grad = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in model.parameters()
+                        if p.requires_grad
+                    )
+                if has_nan_grad:
+                    logging.warning(
+                        f"NaN/Inf gradient detected at batch "
+                        f"{params.batch_idx_train}, skipping optimizer step"
+                    )
+                    optimizer.zero_grad()
+                    # Must call update() to reset GradScaler internal state
+                    # even when skipping the optimizer step.
+                    scaler.update()
+                    params.batch_idx_train -= 1
+                    scheduler.step_batch(params.batch_idx_train)
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+            else:
+                continue
+
+        except:  # noqa
+            save_bad_model()
+            display_and_save_batch(batch, params=params, sp=sp)
+            raise
+
+        if params.print_diagnostics and batch_idx == 5:
+            return
+
+        if (
+            rank == 0
+            and params.batch_idx_train > 0
+            and params.batch_idx_train % params.average_period == 0
+        ):
+            update_averaged_model(
+                params=params,
+                model_cur=model,
+                model_avg=model_avg,
+            )
+
+        if (
+            params.batch_idx_train > 0
+            and params.batch_idx_train % params.save_every_n == 0
+        ):
+            save_checkpoint_with_global_batch_idx(
+                out_dir=params.exp_dir,
+                global_batch_idx=params.batch_idx_train,
+                model=model,
+                model_avg=model_avg,
+                params=params,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sampler=train_dl.sampler,
+                scaler=scaler,
+                rank=rank,
+            )
+            remove_checkpoints(
+                out_dir=params.exp_dir,
+                topk=params.keep_last_k,
+                rank=rank,
+            )
+
+        if batch_idx % 100 == 0 and params.use_fp16 and not params.use_bf16:
+            # If the grad scale was less than 1, try increasing it.    The _growth_interval
+            # of the grad scaler is configurable, but we can't configure it to have different
+            # behavior depending on the current grad scale.
+            cur_grad_scale = scaler._scale.item()
+
+            if cur_grad_scale < 8.0 or (cur_grad_scale < 32.0 and batch_idx % 400 == 0):
+                scaler.update(cur_grad_scale * 2.0)
+            if cur_grad_scale < 0.01:
+                if not saved_bad_model:
+                    save_bad_model(suffix="-first-warning")
+                    saved_bad_model = True
+                logging.warning(f"Grad scale is small: {cur_grad_scale}")
+            if cur_grad_scale < 1.0e-05:
+                save_bad_model()
+                raise RuntimeError(
+                    f"grad_scale is too small, exiting: {cur_grad_scale}"
+                )
+
+        if batch_idx % params.log_interval == 0:
+            cur_lr = max(scheduler.get_last_lr())
+            cur_grad_scale = scaler._scale.item() if (params.use_fp16 and not params.use_bf16) else 1.0
+
+            logging.info(
+                f"Epoch {params.cur_epoch}, "
+                f"batch {batch_idx}, loss[{loss_info}], "
+                f"tot_loss[{tot_loss}], batch size: {batch_size}, "
+                f"lr: {cur_lr:.2e}, "
+                + (f"grad_scale: {scaler._scale.item()}" if (params.use_fp16 and not params.use_bf16) else "")
+            )
+
+            if tb_writer is not None:
+                tb_writer.add_scalar(
+                    "train/learning_rate", cur_lr, params.batch_idx_train
+                )
+
+                loss_info.write_summary(
+                    tb_writer, "train/current_", params.batch_idx_train
+                )
+                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
+                if params.use_fp16 and not params.use_bf16:
+                    tb_writer.add_scalar(
+                        "train/grad_scale", cur_grad_scale, params.batch_idx_train
+                    )
+
+        if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
+            logging.info("Computing validation loss")
+            valid_info = compute_validation_loss(
+                params=params,
+                model=model,
+                sp=sp,
+                valid_dl=valid_dl,
+                world_size=world_size,
+                kd_teacher=kd_teacher,
+                kd_teacher_py=kd_teacher_py,
+            )
+            model.train()
+            logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
+            logging.info(
+                f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
+            )
+            if tb_writer is not None:
+                valid_info.write_summary(
+                    tb_writer, "train/valid_", params.batch_idx_train
+                )
+
+    sub_batch_idx = getattr(params, "sub_batch_idx_train", 0)
+    if sub_batch_idx % params.accum_grad != params.accum_grad - 1:
+        optimizer.zero_grad()
+    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    params.train_loss = loss_value
+    if params.train_loss < params.best_train_loss:
+        params.best_train_epoch = params.cur_epoch
+        params.best_train_loss = params.train_loss
+
+
+def run(rank, world_size, args):
+    """
+    Args:
+      rank:
+        It is a value between 0 and `world_size-1`, which is
+        passed automatically by `mp.spawn()` in :func:`main`.
+        The node with rank 0 is responsible for saving checkpoint.
+      world_size:
+        Number of GPUs for DDP training.
+      args:
+        The return value of get_parser().parse_args()
+    """
+    params = get_params()
+    params.update(vars(args))
+
+    fix_random_seed(params.seed)
+    if world_size > 1:
+        setup_dist(rank, world_size, params.master_port)
+
+    setup_logger(f"{params.exp_dir}/log/log-train")
+    _validate_streaming_config(params)
+    logging.info("Training started")
+
+    if args.tensorboard and rank == 0:
+        tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
+    else:
+        tb_writer = None
+
+    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", rank)
+    logging.info(f"Device: {device}")
+
+    sp = TokenEncoder(params.bpe_model)
+
+    # <blk> is defined in local/train_bpe_model.py
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.vocab_size = sp.get_piece_size()
+
+    if not params.use_transducer:
+        params.ctc_loss_scale = 1.0
+
+    logging.info(params)
+
+    logging.info("About to create model")
+    model = get_model(params)
+
+    if bool(getattr(params, "causal", False)):
+        chunk_sizes = _to_int_tuple(params.chunk_size)
+        left_contexts = _to_int_tuple(params.left_context_frames)
+        samples_per_frame = _infer_samples_per_frame(model)
+        chunk_samples_by_config = tuple(c * samples_per_frame for c in chunk_sizes)
+        logging.info(
+            "Streaming config: chunk_size=%s, left_context_frames=%s, "
+            "decode_chunk_len=%s, chunk_samples=%s, samples_per_frame=%s",
+            chunk_sizes,
+            left_contexts,
+            params.decode_chunk_len,
+            chunk_samples_by_config,
+            samples_per_frame,
+        )
+
+    num_param = sum([p.numel() for p in model.parameters()])
+    logging.info(f"Number of model parameters: {num_param}")
+
+    # Load Teacher for KD (optional)
+    # kd_teacher      — TeacherJIT  for CTC logit distillation (DKD)
+    # kd_teacher_py   — TeacherPy   for intermediate-feature distillation (FitNet/MGD)
+    kd_teacher = None
+    kd_teacher_py = None
+    kd_teacher_path = getattr(params, "kd_teacher_path", "")
+    if kd_teacher_path:
+        from teacher import TeacherJIT
+        kd_teacher = TeacherJIT(
+            kd_teacher_path,
+            device=device,
+            student_tokens_path=params.bpe_model,
+            teacher_tokens_path=getattr(params, "kd_teacher_tokens", ""),
+        )
+        kd_teacher.eval()
+        logging.info(
+            f"KD Teacher (JIT) loaded: {kd_teacher_path}  "
+            f"kd_objective={getattr(params, 'kd_objective', 'ctc')}  "
+            f"kd_loss_scale={params.kd_loss_scale}  "
+            f"kd_temperature={params.kd_temperature}  "
+            f"decoder_ce_scale={getattr(params, 'decoder_ce_scale', 0.0)}  "
+            f"joiner_ce_scale={getattr(params, 'joiner_ce_scale', 0.0)}  "
+            f"joiner_kd_scale={getattr(params, 'joiner_kd_scale', 0.0)}  "
+            f"kd_log_raw_nonblank={getattr(params, 'kd_log_raw_nonblank', True)}  "
+            f"kd_log_on_valid={getattr(params, 'kd_log_on_valid', True)}"
+        )
+
+        use_feature_kd = (
+            getattr(params, "kd_fitnet_scale", 0.0) > 0.0
+            or getattr(params, "kd_mgd_scale", 0.0) > 0.0
+        )
+        if use_feature_kd:
+            from teacher_py import TeacherPy
+            kd_teacher_py = TeacherPy(kd_teacher_path, device=device)
+            kd_teacher_py.eval()
+            logging.info(
+                f"KD Teacher (Python) loaded for feature distillation  "
+                f"fitnet_scale={params.kd_fitnet_scale}  "
+                f"mgd_scale={params.kd_mgd_scale}"
+            )
+
+    assert params.save_every_n >= params.average_period
+    model_avg: Optional[nn.Module] = None
+    if rank == 0:
+        # model_avg is only used with rank 0
+        model_avg = copy.deepcopy(model).to(torch.float64)
+
+    assert params.start_epoch > 0, params.start_epoch
+    checkpoints = load_checkpoint_if_available(
+        params=params, model=model, model_avg=model_avg
+    )
+
+    # Check and reset NaN/Inf in model parameters (e.g. downsample_output.bias)
+    nan_count = 0
+    for name, p in model.named_parameters():
+        if torch.isnan(p.data).any() or torch.isinf(p.data).any():
+            nan_count += 1
+            logging.warning(f"NaN/Inf found in {name}, resetting to zeros")
+            p.data[torch.isnan(p.data)] = 0.0
+            p.data[torch.isinf(p.data)] = 0.0
+    if nan_count > 0:
+        logging.warning(f"Reset {nan_count} parameters with NaN/Inf values")
+    else:
+        logging.info("No NaN/Inf found in model parameters")
+
+    # Freeze params not used in Phase 2 forward path.
+    # They exist in the model from Phase 1 / HubertModel.__init__ but
+    # forward_train_routing() never calls them → NaN gradients in ScaledAdam.
+    unused_patterns = [
+        "downsample_output",   # commented out in zipformer forward
+        "mask_emb",            # Phase 1 SSL masking
+        "final_proj",          # Phase 1 SSL projection head
+        "_streaming_frontend", # not used, training uses HuBERT conv
+    ]
+    if not params.use_transducer:
+        # RNNT components are never called in CTC-only mode → freeze to prevent
+        # ScaledAdam from seeing zero/NaN gradients on these params.
+        unused_patterns += [
+            "decoder",
+            "joiner",
+            "simple_am_proj",
+            "simple_lm_proj",
+        ]
+    frozen_unused = 0
+    for name, p in model.named_parameters():
+        if any(pat in name for pat in unused_patterns):
+            p.requires_grad_(False)
+            frozen_unused += 1
+    if frozen_unused > 0:
+        logging.info(f"Froze {frozen_unused} unused params (not in Phase 2 forward path)")
+
+    # Set lr_scale for encoder to stabilize gradients during unfreeze.
+    # Encoder was pretrained in Phase 1 and needs much lower LR than
+    # randomly-initialized decoder/joiner.
+    # encoder_lr = base_lr * 0.1 (e.g., 0.0002 * 0.1 = 0.00002)
+    encoder_lr_scale = getattr(params, "encoder_lr_scale", 0.1)
+    if not params.freeze_encoder and encoder_lr_scale < 1.0:
+        for name, module in model.named_modules():
+            # Match the zipformer encoder stacks
+            if "encoder.encoder" in name and name.endswith("encoder"):
+                # Only set on the exact encoder module, not sub-modules
+                # This will scale all params inside the zipformer encoder
+                pass
+        # Set on the top-level encoder module
+        for name, module in model.named_modules():
+            if name.endswith("asr_model.encoder.encoder"):
+                module.lr_scale = encoder_lr_scale
+                logging.info(
+                    f"Set lr_scale={encoder_lr_scale} on {name} "
+                    f"(encoder LR = {params.base_lr * encoder_lr_scale:.6f})"
+                )
+                break
+
+    model.to(device)
+    if world_size > 1:
+        logging.info("Using DDP")
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+
+    optimizer = ScaledAdam(
+        get_parameter_groups_with_lrs(model, lr=params.base_lr, include_names=True),
+        lr=params.base_lr,  # should have no effect
+        clipping_scale=2.0,
+    )
+
+    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs,
+                     warmup_batches=int(getattr(params, "warmup_batches", 0)))
+
+    if checkpoints and "optimizer" in checkpoints:
+        try:
+            logging.info("Loading optimizer state dict")
+            optimizer.load_state_dict(checkpoints["optimizer"])
+        except ValueError as e:
+            logging.warning(
+                f"Cannot load optimizer state (parameter groups changed): {e}. "
+                f"Starting optimizer from scratch."
+            )
+
+    if (
+        checkpoints
+        and "scheduler" in checkpoints
+        and checkpoints["scheduler"] is not None
+    ):
+        logging.info("Loading scheduler state dict")
+        scheduler.load_state_dict(checkpoints["scheduler"])
+
+    if params.print_diagnostics:
+        opts = diagnostics.TensorDiagnosticOptions(
+            512
+        )  # allow 4 megabytes per sub-module
+        diagnostic = diagnostics.attach_diagnostics(model, opts)
+
+    if params.inf_check:
+        register_inf_check_hooks(model)
+
+    librispeech = LibriSpeechAsrDataModule(args)
+
+    train_cuts = (
+        librispeech.train_all_shuf_cuts()
+        if params.full_libri
+        else librispeech.train_clean_100_cuts()
+    )
+
+    def remove_short_and_long_utt(c: Cut):
+        # Keep only utterances with duration between 1 second and 20 seconds
+        #
+        # Caution: There is a reason to select 20.0 here. Please see
+        # ../local/display_manifest_statistics.py
+        #
+        # You should use ../local/display_manifest_statistics.py to get
+        # an utterance duration distribution for your dataset to select
+        # the threshold
+        if c.duration < 1.0 or c.duration > 20.0:
+            # logging.warning(
+            #     f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
+            # )
+            return False
+
+        return True
+
+    train_cuts = train_cuts.filter(remove_short_and_long_utt)
+
+    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+        # We only load the sampler's state dict when it loads a checkpoint
+        # saved in the middle of an epoch
+        sampler_state_dict = checkpoints["sampler"]
+    else:
+        sampler_state_dict = None
+
+    train_dl = librispeech.train_dataloaders(
+        train_cuts,
+        do_normalize=params.do_normalize,
+        sampler_state_dict=sampler_state_dict,
+    )
+
+    valid_cuts = librispeech.dev_clean_cuts()
+    valid_cuts += librispeech.dev_other_cuts()
+
+    valid_dl = librispeech.valid_dataloaders(
+        valid_cuts,
+        do_normalize=params.do_normalize,
+    )
+
+    if params.sanity_check and not params.print_diagnostics:
+        scan_pessimistic_batches_for_oom(
+            model=model,
+            train_dl=train_dl,
+            optimizer=optimizer,
+            sp=sp,
+            params=params,
+            kd_teacher=kd_teacher,
+            kd_teacher_py=kd_teacher_py,
+        )
+
+    # BF16 does not need GradScaler (exponent range matches FP32)
+    use_scaler = params.use_fp16 and not params.use_bf16
+    scaler = GradScaler(enabled=use_scaler, init_scale=1.0)
+    if checkpoints and "grad_scaler" in checkpoints:
+        logging.info("Loading grad scaler state dict")
+        scaler.load_state_dict(checkpoints["grad_scaler"])
+
+    # =========================================================================
+    # GPU utilization optimizations
+    # =========================================================================
+    # 1. Enable gradient checkpointing on Zipformer encoder stacks
+    #    Saves VRAM by recomputing activations during backward → allows larger batches
+    base_model = model.module if isinstance(model, DDP) else model
+    asr_encoder = getattr(getattr(base_model, "asr_model", None), "encoder", None)
+    zip_encoder = getattr(asr_encoder, "encoder", None) if asr_encoder else None
+    if zip_encoder is not None:
+        gc_count = 0
+        for enc_module in zip_encoder.encoders:
+            inner_enc = getattr(enc_module, "encoder", enc_module)
+            inner_enc._use_gradient_checkpointing = True
+            gc_count += 1
+        logging.info(f"Gradient checkpointing enabled on {gc_count} Zipformer encoder stacks")
+
+    # 2. Enable Flash/memory-efficient SDP attention
+    if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        logging.info("Flash/memory-efficient SDP attention enabled")
+
+    # 3. CUDA performance settings
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    for epoch in range(params.start_epoch, params.num_epochs + 1):
+        scheduler.step_epoch(epoch - 1)
+        fix_random_seed(params.seed + epoch - 1)
+        train_dl.sampler.set_epoch(epoch - 1)
+        if hasattr(train_dl.dataset, "set_epoch"):
+            train_dl.dataset.set_epoch(epoch - 1)
+        if valid_dl is not None and hasattr(valid_dl.dataset, "set_epoch"):
+            valid_dl.dataset.set_epoch(epoch - 1)
+
+        if tb_writer is not None:
+            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
+
+        params.cur_epoch = epoch
+
+        train_one_epoch(
+            params=params,
+            model=model,
+            model_avg=model_avg,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sp=sp,
+            train_dl=train_dl,
+            valid_dl=valid_dl,
+            scaler=scaler,
+            tb_writer=tb_writer,
+            world_size=world_size,
+            rank=rank,
+            kd_teacher=kd_teacher,
+            kd_teacher_py=kd_teacher_py,
+        )
+
+        if params.print_diagnostics:
+            diagnostic.print_diagnostics()
+            break
+
+        save_checkpoint(
+            params=params,
+            model=model,
+            model_avg=model_avg,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sampler=train_dl.sampler,
+            scaler=scaler,
+            rank=rank,
+        )
+
+    logging.info("Done!")
+
+    if world_size > 1:
+        torch.distributed.barrier()
+        cleanup_dist()
+
+
+def display_and_save_batch(
+    batch: dict,
+    params: AttributeDict,
+    sp: TokenEncoder,
+) -> None:
+    """Display the batch statistics and save the batch into disk.
+
+    Args:
+      batch:
+        A batch of data. See `dataset.HubertAsrDataset()`
+        for the content in it.
+      params:
+        Parameters for training. See :func:`get_params`.
+      sp:
+        The BPE model.
+    """
+    from lhotse.utils import uuid4
+
+    filename = f"{params.exp_dir}/batch-{uuid4()}.pt"
+    logging.info(f"Saving batch to {filename}")
+    torch.save(batch, filename)
+
+    audio = batch["audio"]
+    logging.info(f"audio shape: {audio.shape}")
+
+    # Log total tokens across all speakers
+    total_tokens = 0
+    for texts in batch["y_texts"]:  # texts: List[str] length B
+        y = sp.encode(texts, out_type=int)
+        total_tokens += sum(len(i) for i in y)
+    num_tokens = total_tokens
+    logging.info(f"num tokens (all speakers): {num_tokens}")
+
+
+def scan_pessimistic_batches_for_oom(
+    model: Union[nn.Module, DDP],
+    train_dl: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    sp: TokenEncoder,
+    params: AttributeDict,
+    kd_teacher=None,
+    kd_teacher_py=None,
+):
+    from lhotse.dataset import find_pessimistic_batches
+
+    logging.info(
+        "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
+    )
+    batches, crit_values = find_pessimistic_batches(train_dl.sampler)
+    for criterion, cuts in batches.items():
+        batch = train_dl.dataset[cuts]
+        try:
+            with torch_autocast(enabled=params.use_fp16 or params.use_bf16, **({"dtype": torch.bfloat16} if params.use_bf16 else {})):
+                loss, _ = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=True,
+                    kd_teacher=kd_teacher,
+                    kd_teacher_py=kd_teacher_py,
+                )
+            loss.backward()
+            optimizer.zero_grad()
+        except Exception as e:
+            if "CUDA out of memory" in str(e):
+                logging.error(
+                    "Your GPU ran out of memory with the current "
+                    "max_duration setting. We recommend decreasing "
+                    "max_duration and trying again.\n"
+                    f"Failing criterion: {criterion} "
+                    f"(={crit_values[criterion]}) ..."
+                )
+            display_and_save_batch(batch, params=params, sp=sp)
+            raise
+        logging.info(
+            f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
+        )
+
+
+def main():
+    parser = get_parser()
+    LibriSpeechAsrDataModule.add_arguments(parser)
+    args = parser.parse_args()
+    args.exp_dir = Path(args.exp_dir)
+
+    world_size = args.world_size
+    assert world_size >= 1
+    if world_size > 1:
+        mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        run(rank=0, world_size=1, args=args)
+
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+--- cnn_module_kernel per stack ---
+  stack0: chunkwise_conv kernel=31
+  stack1: chunkwise_conv kernel=31
+  stack2: chunkwise_conv kernel=15
+  stack3: chunkwise_conv kernel=15
+  stack4: chunkwise_conv kernel=15
+  stack5: chunkwise_conv kernel=31
+
+--- PERFECT MATCH verification ---
+Python: 21.720M  |  JIT: 21.720M
+missing=0, unexpected=0
+*** PERFECT MATCH — config confirmed ***
+
+======================================================================
+FINAL CONFIRMED CONFIG
+======================================================================
+Zipformer2(
+    output_downsampling_factor = 2,
+    downsampling_factor        = (1, 2, 4, 8, 4, 2),
+    encoder_dim                = (192, 256, 256, 256, 256, 256),
+    num_encoder_layers         = (2, 2, 2, 2, 2, 2),
+    encoder_unmasked_dim       = (192, 256, 256, 256, 256, 256),
+    num_heads                  = (4, 4, 4, 8, 4, 4),
+    query_head_dim             = 32,
+    pos_head_dim               = 4,
+    value_head_dim             = 12,
+    feedforward_dim            = (512, 768, 768, 768, 768, 768),
+    cnn_module_kernel          = (31, 31, 15, 15, 15, 31),
+    pos_dim                    = 48,
+    causal                     = True,   # load JIT weights, conv structure matches
+    chunk_size                 = [-1],   # full context attention at inference
+    left_context_frames        = [-1],
+)
+
+encoder_embed key: encoder_embed.*  (Conv2dSubsampling + ConvNextBlock)
+simple_am_proj:    simple_am_proj.* weight=[2000,256]
+
+Projection heads:
+  FitNet stack3:  Linear(512 -> 256)  [student stack3 dim=512, teacher dim=256]
+  MGD    stack5:  Linear(256 -> 256)  [student stack5 dim=256, teacher dim=256]
