@@ -52,7 +52,18 @@ def main():
     ap.add_argument("--use-model", action="store_true")
     ap.add_argument("--device", default=None)
     ap.add_argument("--max-files", type=int, default=None)
+    ap.add_argument("--decode-method", choices=["ctc_greedy", "rnnt_beam"],
+                    default="ctc_greedy")
+    ap.add_argument("--beam-size", type=int, default=4)
     args = ap.parse_args()
+
+    modified_beam_search = None
+    if args.decode_method == "rnnt_beam":
+        # Import lazily to avoid hard dependency on full icefall extras
+        # when users only run ctc_greedy.
+        from beam_search import modified_beam_search as _modified_beam_search
+
+        modified_beam_search = _modified_beam_search
 
     os.makedirs(args.out_dir, exist_ok=True)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,9 +112,15 @@ def main():
                     decode_chunk_size=args.decode_chunk_size,
                     left_context_frames=args.left_context_frames,
                 )
-                ctc_tokens, _, _ = ctc_greedy_decode(ms_model, enc_out, enc_lens)
+                if args.decode_method == "rnnt_beam":
+                    hyp_tokens = modified_beam_search(
+                        ms_model.asr_model, enc_out, enc_lens,
+                        beam=args.beam_size,
+                    )[0]
+                else:
+                    hyp_tokens, _, _ = ctc_greedy_decode(ms_model, enc_out, enc_lens)
 
-            hyp_text = tokenizer.decode(ctc_tokens) if ctc_tokens else ""
+            hyp_text = tokenizer.decode(hyp_tokens) if hyp_tokens else ""
 
             ref_words = gt.lower().split()
             hyp_words = hyp_text.lower().split()
@@ -124,6 +141,7 @@ def main():
     msg = (
         f"Checkpoint: {args.checkpoint}\n"
         f"Dir: {args.dir}\n"
+        f"Decode: {args.decode_method} beam={args.beam_size}\n"
         f"Files: {len(wavs)}  Ref words: {total_ref}  Errors: {total_err}\n"
         f"WER: {wer:.2f}%\n"
     )
